@@ -43,13 +43,14 @@ pub mod storage;
 pub mod types;
 
 pub use error::{Result, StorageError};
-pub use types::{PageId, PAGE_SIZE};
+pub use types::{BTreeConfig, PageId, PAGE_SIZE};
 
 // Re-export main public API
 pub use btree::BTree;
 pub use buffer::{BufferPool, BufferPoolImpl};
 pub use storage::{DiskManager, DiskManagerImpl};
 
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::RwLock;
@@ -63,6 +64,8 @@ pub struct Config {
     pub buffer_pool_size: usize,
     /// Whether to sync writes immediately (default: false for performance)
     pub sync_on_write: bool,
+    /// B-tree configuration for node limits
+    pub btree_config: BTreeConfig,
 }
 
 impl Config {
@@ -72,6 +75,7 @@ impl Config {
             path: path.into(),
             buffer_pool_size: 1000,
             sync_on_write: false,
+            btree_config: BTreeConfig::default(),
         }
     }
 
@@ -86,6 +90,28 @@ impl Config {
         self.sync_on_write = enabled;
         self
     }
+
+    /// Set B-tree configuration
+    pub fn btree_config(mut self, config: BTreeConfig) -> Self {
+        self.btree_config = config;
+        self
+    }
+}
+
+/// Node type for visualization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeNode {
+    /// Page ID
+    pub page_id: u32,
+    /// Whether this is a leaf node
+    pub is_leaf: bool,
+    /// Keys in this node
+    pub keys: Vec<String>,
+    /// Values (only for leaf nodes)
+    pub values: Vec<String>,
+    /// Child nodes (only for interior nodes)
+    pub children: Vec<TreeNode>,
 }
 
 /// Main database handle providing key-value storage backed by a B-tree
@@ -97,6 +123,7 @@ pub struct Db {
     buffer_pool: Arc<BufferPoolImpl>,
     #[allow(dead_code)]
     disk_manager: Arc<DiskManagerImpl>,
+    config: Config,
 }
 
 impl Db {
@@ -107,13 +134,22 @@ impl Db {
             disk_manager.clone(),
             config.buffer_pool_size,
         ));
-        let btree = Arc::new(RwLock::new(BTree::new(buffer_pool.clone())?));
+        let btree = Arc::new(RwLock::new(BTree::with_config(
+            buffer_pool.clone(),
+            config.btree_config.clone(),
+        )?));
 
         Ok(Self {
             btree,
             buffer_pool,
             disk_manager,
+            config,
         })
+    }
+
+    /// Get the current B-tree configuration
+    pub fn btree_config(&self) -> BTreeConfig {
+        self.config.btree_config.clone()
     }
 
     /// Get a value by key
@@ -177,6 +213,97 @@ impl Db {
             buffer_pool_size: self.buffer_pool.capacity(),
             tree_height: btree.height(),
         }
+    }
+
+    /// Export the tree structure for visualization
+    pub fn export_tree(&self) -> Result<Option<TreeNode>> {
+        let btree = self.btree.read();
+        let root_page = btree.root_page();
+
+        if root_page.value() == 0 {
+            return Ok(None);
+        }
+
+        self.export_node(root_page)
+    }
+
+    fn export_node(&self, page_id: PageId) -> Result<Option<TreeNode>> {
+        // First, read the page and determine if it's a leaf
+        let is_leaf = {
+            let guard = self.buffer_pool.fetch_page(page_id)?;
+            let page = guard.read();
+            page.is_leaf()
+        };
+
+        if is_leaf {
+            self.export_leaf_node(page_id)
+        } else {
+            self.export_interior_node(page_id)
+        }
+    }
+
+    fn export_leaf_node(&self, page_id: PageId) -> Result<Option<TreeNode>> {
+        let guard = self.buffer_pool.fetch_page(page_id)?;
+        let page = guard.read();
+
+        let mut keys = Vec::new();
+        let mut values = Vec::new();
+
+        for i in 0..page.cell_count() {
+            let cell = page.get_cell(i)?;
+            keys.push(String::from_utf8_lossy(&cell.key).to_string());
+            values.push(String::from_utf8_lossy(&cell.value).to_string());
+        }
+
+        Ok(Some(TreeNode {
+            page_id: page_id.value(),
+            is_leaf: true,
+            keys,
+            values,
+            children: Vec::new(),
+        }))
+    }
+
+    fn export_interior_node(&self, page_id: PageId) -> Result<Option<TreeNode>> {
+        let guard = self.buffer_pool.fetch_page(page_id)?;
+        let page = guard.read();
+
+        let mut keys = Vec::new();
+        let mut child_ids = Vec::new();
+
+        // Collect right_child first (leftmost child)
+        let right_child = page.right_child();
+        if right_child.value() != 0 {
+            child_ids.push(right_child);
+        }
+
+        // Collect all keys and their left_child pointers
+        for i in 0..page.cell_count() {
+            let cell = page.get_cell(i)?;
+            keys.push(String::from_utf8_lossy(&cell.key).to_string());
+            if cell.left_child.value() != 0 {
+                child_ids.push(cell.left_child);
+            }
+        }
+
+        drop(page);
+        drop(guard);
+
+        // Now export all children
+        let mut children = Vec::new();
+        for child_id in child_ids {
+            if let Some(child_node) = self.export_node(child_id)? {
+                children.push(child_node);
+            }
+        }
+
+        Ok(Some(TreeNode {
+            page_id: page_id.value(),
+            is_leaf: false,
+            keys,
+            values: Vec::new(),
+            children,
+        }))
     }
 }
 

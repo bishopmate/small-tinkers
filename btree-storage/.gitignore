@@ -32,3 +32,8 @@ tarpaulin-report.html
 # Backup files
 *.bak
 *.orig
+
+# UI (React) build artifacts
+/ui/node_modules/
+/ui/dist/
+/ui/.vite/

@@ -9,7 +9,7 @@
 use crate::buffer::{BufferPool, BufferPoolImpl};
 use crate::error::{Result, StorageError};
 use crate::page::{Cell, SlottedPage};
-use crate::types::{PageId, MAX_KEY_SIZE, MAX_VALUE_SIZE};
+use crate::types::{BTreeConfig, PageId, MAX_KEY_SIZE, MAX_VALUE_SIZE};
 use std::sync::Arc;
 
 /// A disk-based B-tree
@@ -20,11 +20,18 @@ pub struct BTree {
     root_page: PageId,
     /// Current height of the tree
     height: usize,
+    /// Configuration for node limits
+    config: BTreeConfig,
 }
 
 impl BTree {
-    /// Create a new B-tree or load existing one
+    /// Create a new B-tree or load existing one with default config
     pub fn new(buffer_pool: Arc<BufferPoolImpl>) -> Result<Self> {
+        Self::with_config(buffer_pool, BTreeConfig::default())
+    }
+
+    /// Create a new B-tree with custom configuration
+    pub fn with_config(buffer_pool: Arc<BufferPoolImpl>, config: BTreeConfig) -> Result<Self> {
         // Read root page and height from the persisted file header
         let root_page = buffer_pool.root_page();
         let height = buffer_pool.tree_height() as usize;
@@ -33,7 +40,13 @@ impl BTree {
             buffer_pool,
             root_page,
             height,
+            config,
         })
+    }
+
+    /// Get the configuration
+    pub fn config(&self) -> &BTreeConfig {
+        &self.config
     }
 
     /// Get the height of the tree
@@ -267,8 +280,11 @@ impl BTree {
                 return Ok(None);
             }
 
-            // Check if we have space
-            if page.can_fit(cell_size) {
+            // Check if we have space and haven't exceeded key limit
+            let has_space = page.can_fit(cell_size);
+            let under_limit = page.cell_count() < self.config.max_leaf_keys;
+
+            if has_space && under_limit {
                 drop(page);
                 let mut page = guard.write();
                 page.insert_cell(&cell)?;
@@ -327,7 +343,11 @@ impl BTree {
         {
             let page = guard.read();
 
-            if page.can_fit(cell_size) {
+            // Check if we have space and haven't exceeded key limit
+            let has_space = page.can_fit(cell_size);
+            let under_limit = page.cell_count() < self.config.max_interior_keys;
+
+            if has_space && under_limit {
                 drop(page);
                 let mut page = guard.write();
                 page.insert_cell(&cell)?;
